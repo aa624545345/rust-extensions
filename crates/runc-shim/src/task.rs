@@ -14,9 +14,10 @@
    limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use cgroups_rs::hierarchies::is_cgroup2_unified_mode;
 use containerd_shim::{
     api::{
         CreateTaskRequest, CreateTaskResponse, DeleteRequest, Empty, ExecProcessRequest,
@@ -25,26 +26,35 @@ use containerd_shim::{
     },
     asynchronous::ExitSignal,
     event::Event,
+    other_error,
     protos::{
         api::{
             CloseIORequest, ConnectRequest, ConnectResponse, DeleteResponse, PidsRequest,
             PidsResponse, StatsRequest, StatsResponse, UpdateTaskRequest,
         },
-        events::task::{TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskIO, TaskStart},
+        events::task::{
+            TaskCreate, TaskDelete, TaskExecAdded, TaskExecStarted, TaskIO, TaskOOM, TaskStart,
+        },
         protobuf::MessageDyn,
         shim_async::Task,
         ttrpc,
         ttrpc::r#async::TtrpcContext,
     },
     util::{convert_to_any, convert_to_timestamp, AsOption},
-    TtrpcResult,
+    Error, TtrpcResult,
 };
 use log::{debug, info, warn};
 use oci_spec::runtime::LinuxResources;
-use tokio::sync::{mpsc::Sender, MappedMutexGuard, Mutex, MutexGuard};
+use tokio::{
+    sync::{
+        mpsc::{Receiver, Sender},
+        MappedMutexGuard, Mutex, MutexGuard,
+    },
+    task::spawn,
+};
 
 use super::container::{Container, ContainerFactory};
-
+use crate::cgroup_memory;
 type EventSender = Sender<(String, Box<dyn MessageDyn>)>;
 
 /// TaskService is a Task template struct, it is considered a helper struct,
@@ -93,6 +103,22 @@ impl<F, C> TaskService<F, C> {
             .await
             .unwrap_or_else(|e| warn!("send {} to publisher: {}", topic, e));
     }
+}
+
+fn run_oom_monitor(mut rx: Receiver<String>, id: String, tx: EventSender) {
+    let oom_event = TaskOOM {
+        container_id: id,
+        ..Default::default()
+    };
+    let topic = oom_event.topic();
+    let oom_box = Box::new(oom_event);
+    spawn(async move {
+        while let Some(_item) = rx.recv().await {
+            tx.send((topic.to_string(), oom_box.clone()))
+                .await
+                .unwrap_or_else(|e| warn!("send {} to publisher: {}", topic, e));
+        }
+    });
 }
 
 #[async_trait]
@@ -164,6 +190,22 @@ where
                 ..Default::default()
             })
             .await;
+            if !is_cgroup2_unified_mode() {
+                let path_from_cgorup = cgroup_memory::get_path_from_cgorup(resp.pid).await?;
+                let (mount_root, mount_point) =
+                    cgroup_memory::get_existing_cgroup_mem_path(path_from_cgorup).await?;
+
+                let mem_cgroup_path = mount_point + &mount_root;
+                let rx = cgroup_memory::register_memory_event(
+                    &req.id,
+                    Path::new(&mem_cgroup_path),
+                    "memory.oom_control",
+                )
+                .await
+                .map_err(other_error!(e, "register_memory_event failed:"))?;
+
+                run_oom_monitor(rx, req.id.to_string(), self.tx.clone());
+            }
         } else {
             self.send_event(TaskExecStarted {
                 container_id: req.id.to_string(),
